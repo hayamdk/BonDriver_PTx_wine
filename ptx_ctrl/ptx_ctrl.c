@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 #include "pt3_ioctl.h"
 #include "ptx_ctrl.h"
@@ -139,7 +140,9 @@ PTXCTRL_FUNC int ptx_close_device(int fd)
 
 PTXCTRL_FUNC int ptx_close(ptx_handler_t handler)
 {
+    int fd;
     ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    
     pthread_mutex_lock(&pc->mutex);
     while(pc->state == STATE_READ) {
         pthread_cond_wait(&pc->cond, &pc->mutex);
@@ -148,7 +151,9 @@ PTXCTRL_FUNC int ptx_close(ptx_handler_t handler)
     pthread_cond_signal(&pc->cond);
     pthread_mutex_unlock(&pc->mutex);
     pthread_join(pc->worker, NULL);
-    return close(pc->fd);
+    fd = pc->fd;
+    free(pc);
+    return close(fd);
 }
 
 /*
