@@ -92,7 +92,7 @@ private:
 	int started;
 	DWORD curr_sp;
 	DWORD curr_ch;
-	int fd;
+	ptx_handle_t handle;
 };
 
 extern "C" __declspec(dllexport) IBonDriver * CreateBonDriver()
@@ -118,7 +118,7 @@ CTCPcTuner::~CTCPcTuner()
 const BOOL CTCPcTuner::OpenTuner()
 {
 	//printf("open tuner\n");
-	int ret;
+	ptx_handle_t ret;
 	if (opened) {
 		CloseTuner();
 	}
@@ -128,11 +128,11 @@ const BOOL CTCPcTuner::OpenTuner()
 	} else {
 		ret = pt1_open(tuner_type);
 	}
-	if (ret < 0) {
+	if (ret == NULL) {
 		return FALSE;
 	}
 
-	fd = ret;
+	handle = ret;
 	opened = 1;
 	return TRUE;
 }
@@ -141,11 +141,11 @@ void CTCPcTuner::CloseTuner()
 {
 	//printf("close tuner\n");
 	if (started) {
-		ptx_stop(fd);
+		ptx_stop(handle);
 	}
 	if (opened) {
-		ptx_purge(fd);
-		ptx_close_device(fd);
+		ptx_purge(handle);
+		ptx_close(handle);
 	}
 	started = 0;
 	tune_stat = NOT_TUNED;
@@ -169,9 +169,9 @@ const float CTCPcTuner::GetSignalLevel()
 		return 0.0;
 	}
 	if (tuner_type == ISDB_T) {
-		return (float)ptx_getlevel_t(fd);
+		return (float)ptx_getlevel_t(handle);
 	} else {
-		return (float)ptx_getlevel_s(fd);
+		return (float)ptx_getlevel_s(handle);
 	}
 }
 
@@ -185,7 +185,7 @@ const DWORD CTCPcTuner::WaitTsStream(const DWORD dwTimeOut)
 		return WAIT_ABANDONED;
 	}
 
-	ret = ptx_select(fd, (int)dwTimeOut);
+	ret = ptx_select(handle, (int)dwTimeOut);
 	if(ret > 0) {
 		/* 読み出すデータがある */
 		return WAIT_OBJECT_0;
@@ -210,7 +210,7 @@ void CTCPcTuner::read_all()
 			return;
 		}
 		buf_remain = (BUFSIZE - buf_filled) / 188 * 188;
-		ret = ptx_read(fd, &buf[buf_filled], buf_remain);
+		ret = ptx_read(handle, &buf[buf_filled], buf_remain);
 		if (ret > 0) {
 			buf_filled += ret;
 		} else {
@@ -279,7 +279,7 @@ const BOOL CTCPcTuner::GetTsStream(BYTE **pDst, DWORD *pdwSize, DWORD *pdwRemain
 	}
 
 	if (!started) {
-		if (ptx_start(fd) < 0) {
+		if (ptx_start(handle) < 0) {
 			*pdwSize = *pdwRemain = 0;
 			return FALSE;
 		}
@@ -311,7 +311,7 @@ void CTCPcTuner::PurgeTsStream()
 	//printf("purge\n");
 	if (opened && started) {
 		/* この関数はstartedじゃないときに呼ぶと挙動が変 */
-		ptx_purge(fd);
+		ptx_purge(handle);
 	}
 	buf_pos = 0;
 	buf_filled = 0;
@@ -415,7 +415,7 @@ const BOOL CTCPcTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 
 	if (started) {
 
-		if (ptx_stop(fd) < 0) {
+		if (ptx_stop(handle) < 0) {
 			//printf("ptx_stop() failed! @ SetChannel\n");
 			return FALSE;
 		}
@@ -424,7 +424,7 @@ const BOOL CTCPcTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 
 	freq.frequencyno = ch->freq;
 	freq.slot = ch->slot;
-	if (ptx_tune(fd, &freq) < 0) {
+	if (ptx_tune(handle, &freq) < 0) {
 		tune_stat = TUNE_FAILED;
 		//printf("tune failed!\n");
 	} else {
