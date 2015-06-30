@@ -2,6 +2,7 @@
 @ cdecl pt1_open(long)
 #@ cdecl ptx_open_device(str)
 #@ cdecl ptx_close_device(long)
+@ cdecl ptx_close(str)
 @ cdecl ptx_select(str long)
 @ cdecl ptx_read(str str long)
 @ cdecl ptx_purge(str)

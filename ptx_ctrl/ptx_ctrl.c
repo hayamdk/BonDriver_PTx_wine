@@ -49,21 +49,22 @@ static int gettime_ms(uint64_t *ms)
 static void* worker_thread(void* param)
 {
     ssize_t ret;
-    int state;
+    int end = 0;
     ptx_ctrl_t *pc = (ptx_ctrl_t*)param;
     
     while(1) {
         pthread_mutex_lock(&pc->mutex);
         while( pc->state == STATE_COMPLETED ) {
             pthread_cond_wait(&pc->cond, &pc->mutex);
-            state = pc->state;
+        }
+        if(pc->state == STATE_END) {
+            end = 1;
         }
         pthread_mutex_unlock(&pc->mutex);
         
-        if(state == STATE_END) {
+        if(end) {
             break;
         }
-        
         ret = read(pc->fd, pc->buf, MSG_SIZE);
         
         pthread_mutex_lock(&pc->mutex);
@@ -76,7 +77,7 @@ static void* worker_thread(void* param)
     return NULL;
 }
 
-static ptx_handler_t ptx_open(const char *devfmt, tuner_type_t tuner_type)
+static ptx_handle_t ptx_open(const char *devfmt, tuner_type_t tuner_type)
 {
     int i, fd;
     char dev[128];
@@ -104,7 +105,7 @@ static ptx_handler_t ptx_open(const char *devfmt, tuner_type_t tuner_type)
             pthread_cond_init(&pc->cond, NULL);
             pc->state = STATE_READ;
             pthread_create( &pc->worker, NULL, worker_thread, (void*)pc );
-            return (ptx_handler_t)pc;
+            return (ptx_handle_t)pc;
         }
         
         if(i%2 == 0) {
@@ -116,32 +117,20 @@ static ptx_handler_t ptx_open(const char *devfmt, tuner_type_t tuner_type)
     return NULL;
 }
 
-PTXCTRL_FUNC ptx_handler_t pt3_open(tuner_type_t tuner_type)
+PTXCTRL_FUNC ptx_handle_t pt3_open(tuner_type_t tuner_type)
 {
     return ptx_open("/dev/pt3video%d", tuner_type);
 }
 
-PTXCTRL_FUNC ptx_handler_t pt1_open(tuner_type_t tuner_type)
+PTXCTRL_FUNC ptx_handle_t pt1_open(tuner_type_t tuner_type)
 {
    return ptx_open("/dev/pt1video%d", tuner_type);
 }
 
-/*
-PTXCTRL_FUNC int ptx_open_device(const char *dev)
-{
-    return open(dev, O_RDONLY);
-}
-
-PTXCTRL_FUNC int ptx_close_device(int fd)
-{
-    return close(fd);
-}
-*/
-
-PTXCTRL_FUNC int ptx_close(ptx_handler_t handler)
+PTXCTRL_FUNC int ptx_close(ptx_handle_t handle)
 {
     int fd;
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     
     pthread_mutex_lock(&pc->mutex);
     while(pc->state == STATE_READ) {
@@ -155,21 +144,6 @@ PTXCTRL_FUNC int ptx_close(ptx_handler_t handler)
     free(pc);
     return close(fd);
 }
-
-/*
-PTXCTRL_FUNC int ptx_select(int fd, int timeout_ms)
-{
-    struct timespec ts = {0, 0};
-    fd_set fds;
-    
-    if(timeout_ms > 0) {
-        ts.tv_sec = timeout_ms/1000;
-        ts.tv_nsec = (timeout_ms%1000)*1000*1000;
-    }
-    FD_ZERO(&fds);
-    FD_SET(fd, &fds);
-    return pselect(fd+1, &fds, NULL, NULL, &ts, NULL);
-}*/
 
 static int until(struct timespec *ts_ref)
 {
@@ -186,19 +160,24 @@ static int until(struct timespec *ts_ref)
     return 1;
 }
 
-PTXCTRL_FUNC int ptx_select(ptx_handler_t handler, int timeout_ms)
+PTXCTRL_FUNC int ptx_select(ptx_handle_t handle, int timeout_ms)
 {
     int retval;
     struct timespec ts;
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     
     pthread_mutex_lock(&pc->mutex);
     if( timeout_ms > 0 ) {
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += timeout_ms / 1000;
         ts.tv_nsec += (timeout_ms % 1000) * 1000 * 1000;
-        while( pc->state == STATE_READ && until(&ts) ) {
+        //printf("select %d ms\n", timeout_ms);
+        while( pc->state == STATE_READ ) {
             pthread_cond_timedwait(&pc->cond, &pc->mutex, &ts);
+            if(!until(&ts)) {
+                //printf("select timeout! errno=%d\n", errno);
+                break;
+            }
         }
     } else if( timeout_ms < 0 ) { /* infinite */
         while( pc->state == STATE_READ ) {
@@ -215,36 +194,35 @@ PTXCTRL_FUNC int ptx_select(ptx_handler_t handler, int timeout_ms)
     return retval;
 }
 
-PTXCTRL_FUNC int ptx_read(ptx_handler_t handler, uint8_t *buf, int maxsize)
+PTXCTRL_FUNC int ptx_read(ptx_handle_t handle, uint8_t *buf, int maxsize)
 {
     int  size;
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     
     pthread_mutex_lock(&pc->mutex);
-    if( pc->state == STATE_COMPLETED ) {
-        if( pc->readsize < 0 ) {
-            size = pc->readsize;
-            pc->state = STATE_READ;
-            pthread_cond_signal(&pc->cond);
-        } else if( pc->remain > maxsize ) {
-            size = maxsize;
-            memcpy(buf, &pc->buf[pc->readsize - pc->remain], size);
-            pc->remain -= size;
-        } else {
-            size = pc->remain;
-            memcpy(buf, &pc->buf[pc->readsize - size], size);
-            pc->state = STATE_READ;
-            pthread_cond_signal(&pc->cond);
-        }
+    while( pc->state == STATE_READ ) {
+        pthread_cond_wait(&pc->cond, &pc->mutex);
+    }
+    if( pc->readsize < 0 ) {
+        size = pc->readsize;
+        pc->state = STATE_READ;
+        pthread_cond_signal(&pc->cond);
+    } else if( pc->remain > maxsize ) {
+        size = maxsize;
+        memcpy(buf, &pc->buf[pc->readsize - pc->remain], size);
+        pc->remain -= size;
     } else {
-        size = 0;
+        size = pc->remain;
+        memcpy(buf, &pc->buf[pc->readsize - size], size);
+        pc->state = STATE_READ;
+        pthread_cond_signal(&pc->cond);
     }
     pthread_mutex_unlock(&pc->mutex);
-    //printf("read %d bytes\n", ret);
+    //printf("read %d bytes\n", size);
     return size;
 }
 
-PTXCTRL_FUNC void ptx_purge(ptx_handler_t handler)
+PTXCTRL_FUNC void ptx_purge(ptx_handle_t handle)
 {
     uint8_t tmp[188*256];
     uint64_t t1, t;
@@ -253,9 +231,9 @@ PTXCTRL_FUNC void ptx_purge(ptx_handler_t handler)
         return;
     }
     
-    while(ptx_select(handler, 0) > 0) {
+    while(ptx_select(handle, 0) > 0) {
         //printf("purge read! ...\n");
-        if(ptx_read(handler, tmp, 188*256) <= 0) {
+        if(ptx_read(handle, tmp, 188*256) <= 0) {
             //printf("read 0\n");
             return;
         }
@@ -272,24 +250,24 @@ PTXCTRL_FUNC void ptx_purge(ptx_handler_t handler)
     }
 }
 
-PTXCTRL_FUNC int ptx_tune(ptx_handler_t handler, FREQUENCY *freq)
+PTXCTRL_FUNC int ptx_tune(ptx_handle_t handle, FREQUENCY *freq)
 {
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     //printf("tune: %d %d\n", freq->frequencyno, freq->slot);
     //return ioctl(fd, SET_CHANNEL, freq);
-    ptx_select(handler, -1);
+    ptx_select(handle, -1);
     int ret = ioctl(pc->fd, SET_CHANNEL, freq);
     //ptx_getlevel_t(fd); ??????
     return ret;
 }
 
-PTXCTRL_FUNC double ptx_getlevel_t(ptx_handler_t handler)
+PTXCTRL_FUNC double ptx_getlevel_t(ptx_handle_t handle)
 {
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     int rc;
     double p;
     
-    ptx_select(handler, -1);
+    ptx_select(handle, -1);
     if( ioctl(pc->fd, GET_SIGNAL_STRENGTH, (uint64_t)(&rc)) < 0 ) {
         return 0.0;
     }
@@ -301,9 +279,9 @@ PTXCTRL_FUNC double ptx_getlevel_t(ptx_handler_t handler)
                 (0.0398 * p * p) + (0.5491 * p)+3.0965;
 }
 
-PTXCTRL_FUNC double ptx_getlevel_s(ptx_handler_t handler)
+PTXCTRL_FUNC double ptx_getlevel_s(ptx_handle_t handle)
 {
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
     int rc;
     unsigned char sigbuf[4];
     float fMixRate;
@@ -326,7 +304,7 @@ PTXCTRL_FUNC double ptx_getlevel_s(ptx_handler_t handler)
         0.000f     // B0    00    45056    -0.01dB
     };
     
-    ptx_select(handler, -1);
+    ptx_select(handle, -1);
     if( ioctl(pc->fd, GET_SIGNAL_STRENGTH, (uint64_t)(&rc)) < 0 ) {
         return 0.0;
     }
@@ -352,17 +330,17 @@ PTXCTRL_FUNC double ptx_getlevel_s(ptx_handler_t handler)
     }
 }
 
-PTXCTRL_FUNC int ptx_start(ptx_handler_t handler)
+PTXCTRL_FUNC int ptx_start(ptx_handle_t handle)
 {
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
-    ptx_select(handler, -1);
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
+    ptx_select(handle, -1);
     return ioctl(pc->fd, START_REC, 0);
 }
 
-PTXCTRL_FUNC int ptx_stop(ptx_handler_t handler)
+PTXCTRL_FUNC int ptx_stop(ptx_handle_t handle)
 {
-    ptx_ctrl_t *pc = (ptx_handler_t)handler;
-    ptx_select(handler, -1);
+    ptx_ctrl_t *pc = (ptx_handle_t)handle;
+    ptx_select(handle, -1);
     return ioctl(pc->fd, STOP_REC, 0);
 }
 
